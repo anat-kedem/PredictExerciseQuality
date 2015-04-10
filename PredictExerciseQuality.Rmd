@@ -1,0 +1,331 @@
+---
+title: "Predict Exercise Quality"
+author: "Anat Kedem"
+date: "Friday, April 10, 2015"
+output: html_document
+---
+
+The data reference:  
+HAR - Human Activity Recognition
+http://groupware.les.inf.puc-rio.br/har
+ 
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+ 
+**Note:**
+**Please see the following terms of use for the original data and any derivatives of the data (citation from the above site):**
+"Important: you are free to use this dataset for any purpose. This dataset is licensed under the Creative Commons license (CC BY-SA). The CC BY-SA license means you can remix, tweak, and build upon this work even for commercial purposes, as long as you credit the authors of the original work and you license your new creations under the identical terms we are licensing to you. This license is often compared to "copyleft" free and open source software licenses. All new works based on this dataset will carry the same license, so any derivatives will also allow commercial use."  
+
+
+##1. Introduction
+
+This report (submitted as an assignment in the Coursera *Practical Machine Learning* course) implies that wearable computers (wearables) can supply feedback to indicate exercise performance level. The data in this report include measurements recorded by wearables during weight lifting exercise, by six subjects that performed the exercise in 5 different ways (performance levels). The data include a variable named **classe** that identify the performance level ("A" to "E"). A model built here using the random forest function combined with train function cross validation (caret package), predict the level of performance with an out of sample error of 1.3%.  
+  
+
+  - Required R packages: data.table, caret, randomForest, lattice, ggplot2.  
+
+```{r loadRPackages, echo=TRUE}
+suppressWarnings({suppressPackageStartupMessages({invisible(library(data.table)); invisible(library(caret)) ; invisible(library(randomForest))})})
+```
+
+##2. Reading and Cleaning the Data (verify tidy data)
+
+The data file used here is pml-training.csv. The code assume that this file exist in the working directory. An optional code is included to download the file to the working directory.  
+
+1. Read the train data and review some variables of the last four lines.  
+
+The data include variables of different types, as classifying variables (user_name), measured variables (gyros_arm_x), calculated variables (var_accel_arm). The first variable (V1) is a serial number, and the last variable is the classe variable (the one to be predicted).  
+
+```{r readTest, echo=FALSE, results='hide'}
+test20 <- fread("pml-testing.csv", nrows=20, sep=",", header=TRUE, na.strings = c("?","NA","")) 
+test20[1,c(1:3, 158:160), with=FALSE]
+```
+
+
+```{r readTrainData, echo=TRUE}
+##optional file download:
+#URL <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+#download.file(URL, "pml-training.csv")
+
+fullData <- fread("pml-training.csv", select=c(1:160), sep=",", 
+                  header=TRUE, na.strings = c("?","NA","")) 
+tail(fullData[,c(1:10),with=FALSE],4)
+tail(fullData[,c(1,134:136),with=FALSE],4)
+tail(fullData[,c(1,158:160),with=FALSE],4)
+```
+
+
+2. Clean the data.  
+
+The last four rows include many variables with NAs. In addition, the last row differ than the other rows, it is actually a subtotal row for some variables. For example, it contains minimum and maximum values for the measured values for some variables. It also includes values like #DIV/0! (for example, in min_yaw_forearm). In the last row, the value in variable new_window is *yes* (unlike the other rows).  
+
+  - Check which variable contains NAs and how many (example, columns 1 to 18):  
+
+```{r checkNA, echo=TRUE}
+sapply(fullData[,1:18,with=FALSE], function(x) sum(is.na(x))) #how many NAs in columns 1 to 18
+sum(sapply(fullData, function(x) sum(is.na(x))) == 19216) #how many columns contain 19216 NAs
+dim(fullData) ; 19622-19216
+```
+
+  There are 100 variables (out of total 160 variables) that contain each 19216 NAs. That leave only 406 observations with actual values for these variables which are only ~2% of the observations of the predicted variable. These 406 observations are subtotal rows as the one described above.  
+
+  - Verify that variable new_window identify the subtotal rows, by a table comparing its values to variable min_yaw_forearm.
+  
+  The new_window value *yes* fit the 406 observations with calculated group values.  
+
+```{r checkSummaryObservations, echo=TRUE}
+table(fullData$new_window,fullData$skewness_yaw_belt)
+```
+
+  - Remove the 406 subtotal rows to get a tidy data:  
+
+```{r removeSummaryLines, echo=TRUE}
+fullData <- fullData[new_window == "no",]
+```
+
+The data is now tidy and include 19216 observations and 160 variables.  
+
+```{r dimTidy, echo=TRUE}
+dim(fullData)
+```
+
+  - Explore the variables distribution and look for errors:  
+  
+  The data summary (some examples below) show that many of the variables have (more or less) zero center. Some variables show abnormal values. For example, the 3rd Qu. of the gyros_forearm_y include values between -7.020 to 1.620 while the maximum value is 311.000. They are checked to verify if they should be considered as skewed variables and treated in the training dataset or there might reflect some errors that better excluded from the data.  
+  
+```{r dataSummary, echo=TRUE}
+summary(fullData[,c(8:10),with=FALSE],digits = 2)
+summary(fullData[,c(119:121),with=FALSE],digits = 2)
+summary(fullData[,c(151:153),with=FALSE],digits = 2)
+```
+
+  the following code check which rows contain abnormal values. It appears that only two rows contain these abnormal values and therefore they are removed (row no. 5270 and row no. 9088).  
+
+```{r checkErrorRows, echo=TRUE}
+fullData[fullData$gyros_forearm_z > 5,which=TRUE]
+fullData[fullData$gyros_forearm_y > 10,which=TRUE]
+fullData[fullData$gyros_dumbbell_z > 5,which=TRUE]
+fullData[fullData$magnet_dumbbell_y < -800,which=TRUE]
+```
+
+  - Remove two error rows from the data.  
+
+```{r removeErrorRows,echo=TRUE}
+fullData <- fullData[-c(5270,9088),]
+```
+  
+
+##3. Data Partitioning
+
+The train data is divided by random sampling in order to train the model with part of the data and then test the model with 'additional' data. The data is divided to 3 parts: training data, testing data and validating data. In case of a large *out of sample error* calculated by testing the model with the validating data, it will be possible to further train the model and then test the model with the testing data to estimate the error.  
+
+  - Divide the train data to training (~60%), validating (~20%), and testing (~20%) datasets.  
+
+```{r partitioning, echo=TRUE}
+set.seed(1000)
+rowsTrTs <- as.vector(createDataPartition(y=fullData$classe, p=0.8, list=FALSE))
+tempTrTs <- fullData[rowsTrTs,]
+testing <- fullData[-rowsTrTs,]
+set.seed(1500)
+rowsTr <- as.vector(createDataPartition(y=tempTrTs$classe, p=0.75, list=FALSE))
+training <- tempTrTs[rowsTr,]
+validating <- tempTrTs[-rowsTr,]
+```
+
+##4. Exploring and Transforming the Training Data
+
+1. Drop unused variables from the **training** dataset.  
+
+For the purpose of modeling and working with modeling functions, it is efficient to drop unusable variables.  
+
+Variables that expected to predict the performance levels of the exercise are mainly the measured values from the wearables. Some variables, as continuous time recording, are not expected to be used as predictors, since the prediction here is not based on a wave-form (created by time vs. values) but on groups of distinct values.  
+
+The following code keep the variables that include measured values, and drop the 100 variables that are mostly NAs (as described above), drop calculated variables (variables with names as total), drop the first variable (serial number), drop continues-time variables, and drop the variable new_window (now contain only one value *no*).  
+
+It is assumed that variables such as user_name and cvtd_timestamp (9 unique values) can use as predictors. However, the model will try to predict the performance level with no dependencies as certain user or date-time, so that the model will enable to predict the level of performance for new users and at any other date-time. Therefore, these two variables are also dropped.  
+
+```{r dropUndusedVar, echo=TRUE}
+training <- training[new_window == "no",c(8:10,37:48,60:68,84:86,113:124,151:160), with=FALSE]
+dim(training)
+```
+
+The training data include 11532 observations and 49 variables from which the last variable is the **classe** (the outcome) and all other variables are the measured values from the 4 monitors (there are 12 variables for each monitor: roll, pitch, yaw, gyros(x,y,z), accel(x,y,z), and magnet(x,y,z)).  
+
+  - set classe as factor:  
+  
+  The variable classe is used as classifier and the following code convert it to factor.  
+
+```{r setFactorsTraining, echo=TRUE}
+training$classe <- as.factor(training$classe)
+```
+
+
+2. Explore the training data.  
+
+To better understand the data structure, the left graph (A) shows that the data is ordered by *classe* (starting from classe A - black). This should be considered when choosing a cross validation sampling method. The right graph (B) shows that the combination of two selected variables can predict correctly the class "A" in the first row of the validating dataset (magenta triangle).  
+
+  - Plot 2 graphs to explore data order and two variables ratio.  
+
+```{r explorationGraphs, echo=TRUE}
+par(mfrow=c(1,2))
+plot(training$roll_arm,col=training$classe, main="A - Explore the data order \n (color = classe)")
+plot(training$roll_arm, training$pitch_arm, col=training$classe, main="B - Explore two variables \n (color = classe)")
+points(validating$roll_arm[1], validating$pitch_arm[1], col="magenta", pch=17)
+```
+
+  - Look for variables with zero variance.  
+ 
+The following code count how many variables have zero variance, using the function nearZeroVar that return a matrix that include a variable zeroVar. The zeroVar variable contain TRUE or FALSE. The "0" indicates that non of the variables is considered as with zero variance.  
+
+```{r checkZeroVar, echo=TRUE}
+sum(nearZeroVar(training,saveMetrics=TRUE)$zeroVar)
+```
+
+
+##5. Data Modeling and Testing
+
+The model that examined here is random forest, predicting using classification tree. The model use cross validation to reduce the prediction error due to overfitting, low sampling quality, and outliers. Cross validation option is built in the random forest function **rf** and in the **train** function. The final tree from the rf function is based on dozens of trees used as cross validation. It has a tuning parameter *mtry* that enable to set the number of variables randomly selected for each node (split), and then select the best among these. In addition, the train function enable to select cross validation method to specify the sampling method and number of samplings. Also, the number of trees can be controlled.  
+ 
+The sampling method used here through the train function is resampling 6 times (number=6) without replacement (method="LGOCV"), each resample is 75% of the training data (p=0.75). The number of trees set to 87. The number of trees is much lower than the default, since the modeling is based on thousands of observations and the data is resampled 6 times, it is assumed as sufficient cross validation parameters. The number of mtry set to about half the number of variables, since the variability of their importance is unknown yet.  
+
+
+  1. Create random forest model with cross validations:  
+
+```{r dataModeling, echo=TRUE}
+startRun1 <- Sys.time()
+set.seed(3000)
+#setnames(training,49,"classe")
+modFit <- train(classe~ .,data=training, method="rf", trControl = trainControl(method = "LGOCV", p=0.75, number=6), ntree=87, tuneGrid = data.frame(mtry = 25), prox=TRUE) 
+endRun1 <- Sys.time()
+round(endRun1-startRun1,2) #run time modFit
+```
+
+  With the parameters combination of cross validation set above, the model is created in ~3 minutes.  
+
+  2. Test the model on the validating dataset:  
+  
+  The model is tested with the validating dataset. First, the model *predict* the outcome for the validating dataset and then the *confusionMatrix* indicate the accuracy of this prediction. The **accurary** 0.993 is *all correct outcomes/all outcomes*. The **Balanced Accuracy** for each type of classe ("A" to "E") is *(Sensitivity+Specificity)/2* and show that type "C" has the lower accuracy (0.9880) and type "E" has the highest (0.9997). The **Kappa** statistics (0.9911) also consider the random chance of true prediction as depended also on the number of each type of classe and might better reflect the error for this kind of outcome.  
+  
+```{r validating, echo=TRUE}
+set.seed(4000)
+validatingResults <- predict(modFit, validating)
+
+confusionMatrix(validating$classe, validatingResults)
+```
+
+  The question is now: **can the accuracy improved?**. An accuracy of ~99% might not be easily improved. However, checking the information stored in the model might supply some clue regarding the model efficiency.  
+  
+  - Check the efficiency of cross validation:  
+  
+  The following graph (C) shows that as the number of trees increase, the error rates are reduced. These are errors calculated during the model build (they are not represent the results of implying the model on the testing dataset). It seems that the errors rate is almost constant for number of trees grater than 60.  
+ 
+```{r plotTreesErr, echo=TRUE}
+par(mfrow=c(1,1))
+plot(modFit$finalModel, main="C - Cross Validations: Number of Trees vs. Errors")
+```
+
+  - Check variables importance:  
+
+```{r varImportance, echo=TRUE}
+variablesRating <- varImp(object=modFit, useModel="TRUE")
+#variablesRating$importance:
+variablesRating <- variablesRating$importance[order(variablesRating$importance[,"Overall"],decreasing=TRUE), , drop = FALSE] #sort by importance, keep all
+head(variablesRating,5)
+tail(variablesRating,5)
+```
+
+  The variables rating (above) show their importance from 0 to 100 (default is 0 to 100). The variables with the lowest importance levels are of different monitors, and not represent one specific monitor, so it can be assumed that all monitors are required for predicting the performance level.  
+
+  3. Improving the model:  
+  
+  As mentioned above, the accuracy is not expected to increased dramatically with more trees (and anyhow accuracy of ~99% cant increased dramatically). However, it is interesting to see the effect of increasing trees vs. decreasing the number of samplings. The model is re-built with fewer resamplings (2 instead of 6), but with more trees (101 instead of 87).  
+
+```{r rebuiltModel, echo=TRUE}
+setnames(training,49,"classe")
+startRun2 <- Sys.time()
+set.seed(3000)
+modFit <- train(classe~ .,data=training, method="rf", trControl = trainControl(method = "LGOCV", p=0.75, number=2), ntree=101, tuneGrid = data.frame(mtry = 25), prox=TRUE) 
+endRun2 <- Sys.time()
+round(endRun2-startRun2,2) #run time modFit
+```
+
+  - Test the model again on the validating dataset:  
+  
+  The model is tested again with the validating dataset. The new **accuracy** is 0.994 (all correct outcomes/all outcomes), and the new Kappa is 0.9924. It seems that the model accuracy increased a bit and the model was created faster (2 minutes vs. 3 minutes).  
+
+```{r revalidating,echo=TRUE}
+set.seed(4000)
+validatingResults <- predict(modFit, validating)
+
+confusionMatrix(validating$classe, validatingResults)
+```
+
+  - Model info:  
+  
+  The following *modFit* show that the model created with the Random Forest method, and is based on 48 predictors, 5 possible classe types for the outcome, two resamples 8651 rows each, and a random selection of 25 predictors to test with each node in the tree. It also show an accuracy information indicate the in-sample error, calculated for the prediction of the training dataset only.  
+  
+```{r finalModelInfo,echo=TRUE}
+modFit
+modFit$resample #in-sample accuracy
+
+head(modFit$control$index$Resample1,20) #row number in train dataset (1)
+head(modFit$control$index$Resample2,20) #row number in train dataset (2)
+
+length(modFit$control$index$Resample1) #number of rows in the first resample
+length(modFit$control$index$Resample2) #number of rows in the second resample
+```
+
+  The model predictors:  
+
+```{r modelPredictors,echo=TRUE}
+names(modFit$trainingData)
+```
+
+
+##6. Define the Model Out of Sample Error
+
+  - Check the model out of sample error with the testing dataset.  
+  
+  The model "out of sample error" is defined by predicting the outcome (classe) for the testing dataset and comparing the results to the real values in classe:  
+
+```{r testing, echo=TRUE}
+set.seed(4000)
+testingResults <- predict(modFit, testing)
+confusionMatrix(testing$classe, testingResults)
+```
+
+  - Check the ration between the amounts of obvservations for each classe type:  
+  
+  As mentioned above, the data partitioning kept the original ratio of amount of observations for each classe type. It is an important parameter for the model error. As can be seen from the following code, there are unequal amount of observations of the different classe types:  
+
+```{r checkClasseRatio, echo=TRUE}
+setnames(training,49,"classe")
+table(training$classe)
+```
+
+  - Define the out of sample error of the model:  
+  
+  The accuracy of the model (total correct predictions/all predictions) is 0.9893 which define an error of ~1%. However, since the train dataset (as well as the complete data) include unequal amounts of each type "A" to "E" in classe, it might be more appropriate to also consider the random probability to guess each type. Therefore **the final model out of sample error is 1.3%** defined here as 1-Kappa (1-0.9865).  
+  
+##Summary
+
+A model was built to predict the performance level (one of 5 possible levels) of weight lifting exercise, based on data collected with wearable monitors during the exercises. The prediction is based on 48 variables collected from 3 body monitors (arm, forearm, belt) and one weight monitor (dumbbell), each contributes 12 variables: roll, pitch, yaw, gyros(x,y,z), accel(x,y,z), and magnet(x,y,z). To get a tidy data, two error rows were omitted, and 406 subtotal rows were omitted.  
+
+The data was divided to three random samples *training* (60% of the original data), *validating* (20%), and *testing* (20%), keeping the original ratio of observation amounts for each classe type ("A", "B", "C", "D", or "E"), using the **createDataPartition** function.  
+
+The model was built with the **rf** function (fandom forest classification trees), with random selection of 25 variables for each node/split testing, and is based on the creation of 101 trees. Additional cross validation applied with the **train** function with resampling (two resamples).  
+
+The model was trained with the training dataset, examined with the validating dataset, improved and trained again with the training vs. validating datasets, and finally examined with the testing dataset and defined an out of sample error of 1.3% based on the Kappa statistics from the prediction results for the testing dataset.  
+
+##References:
+
+1. Data source in HAR site:  
+http://groupware.les.inf.puc-rio.br/har
+
+2. Random Forest:
+http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#workings
+
+3. Train control:  
+http://topepo.github.io/caret/training.html#control
+
+4. Confusion matrix:  
+http://www.inside-r.org/node/86995
